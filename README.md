@@ -1,91 +1,59 @@
-# Origin AI Engineering Take-Home: Referral Inbox Triage Agent
+# Referral Inbox Triage Agent
 
-Origin builds software for pediatric therapy practices. In this assignment, you are helping a fictional practice, Cedar Kids Therapy, triage its Monday inbox.
+A take-home implementation: triage 8 inbox items at a pediatric SLP / OT / PT practice into structured outputs — classification, intake extraction, routing decisions, and draft replies — without auto-sending anything.
 
-## Scenario
+## How to Run
 
-It is Monday at 8am at a multi-disciplinary pediatric therapy practice supporting speech-language pathology, occupational therapy, and physical therapy. The shared inbox accumulated items over the weekend from pediatrician fax referrals, parent voicemails, parent portal messages, and emails. Build an AI agent prototype that turns the messy batch into a sorted, human-reviewable action plan.
-
-## What We Expect
-
-Strong submissions are usually incomplete but honest. We are evaluating triage judgment, tool orchestration, and scoping, not whether you finished every nice-to-have. Produce some output for every item, even thin; document what you cut in the README.
-
-You may use any AI coding agent (Claude Code, Cursor, Codex, etc.) while building. State your stack and assumptions in your README.
-
-Runtime LLM usage is allowed and recommended, but not required. Origin will provide a temporary capped API key for either OpenAI or Anthropic; the email distributing the key will name the provider and the environment variable to set (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`). You may also use your own provider. You may install dependencies for the provider you choose (e.g., `npm install openai` or `npm install @anthropic-ai/sdk`). Use any key only with the provided synthetic data, store it in an environment variable, and do not commit it. Model choice is not part of the rubric.
-
-## How To Run
-
-```bash
+```sh
 npm install
-npm run triage   -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
-npm run validate -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
+echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
+npm run triage
+npm run validate
 ```
 
-The commands also work with no flags and default to the paths above. Reviewers may run the same commands against similar hidden synthetic input. Do not hardcode input, output, or trace paths.
+`npm run triage` reads `data/inbox.json` and writes `output.json` plus a per-item tool-call trace at `.trace/tool-calls.jsonl`. `npm run validate` checks the output against `schema/output.schema.json` and the batch-level invariants in `src/validate.ts`.
 
-## Share And Submit
+## Stack and Runtime
 
-Create your own GitHub repo from this starter pack and implement your solution there. The repo can be public or private. When you are done, submit the repo link. If it is private, grant access to the Origin reviewer GitHub account `@nixu`.
+TypeScript, Node LTS, [`@anthropic-ai/sdk`](https://github.com/anthropics/anthropic-sdk-typescript), [`zod`](https://github.com/colinhacks/zod).
 
-Commit your code, your updated `README.md`, and your final generated `output.json`. Do not commit API keys, `.env` files, real PHI, `node_modules/`, or `.trace/`.
+Model: `claude-sonnet-4-6` (env-overridable via `ANTHROPIC_MODEL`). Runtime: ~2-3 minutes for 8 items.
 
-We expect you to spend about 2 hours. If you stop before finishing, commit what you have and describe the cuts in your README.
+## Architecture
 
-Update this README with these sections before submitting:
+A 4-stage hybrid pipeline runs per inbox item, parallelized across the batch:
 
-1. How to run
-2. Stack and runtime
-3. Architecture
-4. Failure modes and production eval
-5. What I chose not to build, and why
-6. What I would do with another 4 hours
+**1. LLM classify + extract** (`classifyAndExtract`). Anthropic SDK structured output via a Zod schema. Extracts intake fields (child name, DOB or age, parent contact, discipline, diagnosis/concern, payer, member ID), the classification enum, urgency P0–P3, the safeguarding flag, and a `missing_info` list. System prompt has a `cache_control` breakpoint configured; would activate once the prompt exceeds the 2048-token minimum cacheable prefix.
 
-## Your Task
+**2. Deterministic router** (`routeItem`). Plain TypeScript that branches on classification + tool results. The insurance chain branches on the `verify_insurance` result, not on what the referral document claims: `in_network` → `find_slots` → `hold_slot` on the earliest → intake task; `out_of_network` → policy lookup + billing task only (no hold); `expired` or `unknown` → billing task with the discrepancy surfaced in the rationale. Safeguarding overrides all other classification — escalate P0, lookup the safeguarding policy, neutral acknowledgement only.
 
-Implement the agent in `src/agent.ts`. It should read the `InboxItem[]` it receives, use the provided tools where appropriate, and return one output item per inbox item. `src/index.ts` wraps your items with `buildBatchOutput()` and writes the final `output.json`.
+**3. LLM draft** (`draftReply`). Anthropic SDK plain text completion, capped at 300 output tokens. Language is detected from `item.body` up front and passed as an authoritative signal to the prompt — the model is explicitly told not to re-decide based on the sender's name or topic. Channel (`portal` / `email` / `phone`) and recipient are likewise derived deterministically and passed to `draft_message`.
 
-Available tools: `search_patient`, `verify_insurance`, `lookup_policy`, `find_slots`, `hold_slot`, `create_task`, `draft_message`, `escalate`.
+**4. Assembler** (`assembleItemOutput`). Pure function. Builds a schema-valid `ItemOutput`, pulling `tools_called` from `getToolCallsForItem(item.id)` unchanged so the audit log matches the trace exactly.
 
-Use `schema/output.schema.json` as the source of truth for the output shape. `data/example_output.json` shows one non-trivial worked item. It is illustrative and is not expected to pass validation by itself. **Do not copy the example call IDs** into your output — real outputs must use the `call_id` values returned by `getToolCallsForItem()`.
+**Why hybrid over a pure LLM agent.** Deterministic routing gives auditable, predictable tool calls — given a classification and a verified insurance status, the same tools fire every time, in the same order. The LLM handles what it is good at: reading messy unstructured text, catching safeguarding disclosures phrased casually, mirroring the sender's language. Code handles what needs reliability: which tools fire, schema validity, PHI discipline.
 
-## Time Box
+## Guardrails and Failure Modes
 
-Spend about 2 hours. Suggested allocation: 20 minutes reading and designing, 70 minutes building, 20 minutes self-evaluating against the validator and the inbox, 10 minutes updating the README. Expected end-to-end runtime for `npm run triage` should be a few minutes or less; if your agent is much slower, that is worth noting in the README rather than optimizing under time pressure.
+- **Safeguarding.** Any hint of harm, abuse, or unsafe caregiving — even mentioned casually in passing — sets `safeguarding: true`, fires `escalate` with severity P0, loads the safeguarding policy, and constrains the draft to a neutral acknowledgement only. The draft never references the disclosure, the alleged person, or anything else that could tip off an unsafe caregiver who might also see the family's messages.
+- **No clinical advice.** Items classified as `clinical_question` route to a clinical-lead screening task. The draft is instructed not to name conditions, not to give developmental milestones, and not to say "probably normal" or "you should be worried" — it offers an evaluation as the path to a real answer.
+- **Never confirm appointments.** Slot holds are described as "held pending staff review." The draft prompt explicitly forbids "confirmed," "scheduled," and similar phrasing. Staff finalizes scheduling, not the agent.
+- **Language mirroring.** A deterministic heuristic detects language from `item.body` (not the sender name, not the subject), and the result is passed to the draft prompt as an authoritative "Reply language" line. The LLM is told it must not re-decide. This was a real bug caught in iteration: a safeguarding case from an English-writing parent with a Spanish name produced a Spanish reply until the language signal was made authoritative.
+- **Human in the loop.** Every item ships with `requires_human_review = true`. `draft_message` records a draft for staff review; it does not send. The pipeline is an assistant, not an autonomous actor.
+- **System of record.** `verify_insurance` is the source of truth — when its result conflicts with what the referral document says (expired coverage, out-of-network despite the referrer marking it in-network), the verified result wins and the discrepancy is surfaced in `decision_rationale`. The relevant policy snippet (`insurance`) is loaded so staff has the rule in hand.
+- **Calibrated escalation.** P0 is reserved for safeguarding. P1 is same-day operational impact (today's appointment confusion, same-day cancellation, an active complaint needing today's response). P2 is standard intake. P3 is informational. Over-escalation is itself a failure mode in the assignment rubric, so the urgency rubric is conservative outside the safeguarding case.
 
-Minimum viable submission: processes every item in `data/inbox.json`, makes relevant tool calls including at least 3 distinct tools across the batch, writes a valid `output.json`, and passes `npm run validate`. Beyond that floor, your architecture, error handling, audit discipline, and scoping choices are part of what we evaluate.
+## What I Chose Not to Build
 
-## Constraints
+- **LangChain / LangGraph agent loop.** A graph-based agent loop would generalize routing to inbox shapes the prompt does not anticipate, but adds framework complexity and non-deterministic tool selection. Under a 2-hour time box for a regulated-domain workflow, deterministic TypeScript routing is more auditable and easier to defend in review.
+- **PHI encryption at rest.** Synthetic data only per the assignment constraints. In production: field-level encryption before any LLM call, a tightly scoped retention policy on the trace log, and a HIPAA BAA with the LLM provider — none of which is exercised by a synthetic-data take-home.
+- **Retry logic on LLM failures.** Currently a thrown error fails the single item (it does not crash the batch — items run via `Promise.all`, so a failure surfaces as a rejected promise for that item alone). Production-grade: exponential backoff with jitter on `classifyAndExtract` and `draftReply` calls, on top of the SDK's built-in 429 / 5xx retries.
+- **Confidence scoring on classification.** Low-confidence items could be flagged for human classification review rather than fed into the deterministic router. Currently the router trusts the classifier's output.
 
-- Use TypeScript, Node LTS, and npm. If this creates a real accessibility or environment issue, reach out.
-- Use the provided tools in `src/tools.ts`; do not modify, reimplement, or bypass them. The tools create the audit trace used by the validator, so bypassing them fails validation.
-- Use at least 3 distinct tools across the batch. Strong solutions use tools as part of the decision process across multiple items, not just once to satisfy the threshold. Irrelevant or performative tool calls will be penalized.
-- Use `withItemContext(item.id, async () => ...)` around item-level tool calls.
-- Use `getToolCallsForItem(item.id)` for `tools_called[]`; pass the returned entries through unchanged.
-- Use `buildBatchOutput(items)` through the starter `src/index.ts`; do not hand-compute summary counts.
-- Do not auto-send messages. Use `draft_message` only.
-- Do not schedule appointments. `find_slots` and `hold_slot` are reviewable; scheduling is not.
-- Use only synthetic data. Do not add real PHI.
+## What I Would Do With Another 4 Hours
 
-## Urgency Calibration
-
-- `P0`: safeguarding, imminent harm, mandated-reporter escalation. Same-hour human review.
-- `P1`: same-day operational issue requiring prompt staff action.
-- `P2`: normal intake, scheduling, billing, or clinical-review workflow.
-- `P3`: low-priority admin, FYI, spam.
-
-Default to `P2` unless there is a clear safety or same-day operational reason. Over-escalation is itself a production failure mode.
-
-## Review Variants
-
-Similar synthetic variants may be run during review. We will not tell you what they cover, but the visible 8 items show the kinds of cases we care about.
-
-## Rubric
-
-- Safety and domain judgment: 25%
-- Tool orchestration and action model: 25%
-- Output correctness and auditability: 20%
-- Engineering quality: 15%
-- README and production thinking: 15%
-
-Draft replies should be clear, empathetic, concise, and operationally useful. They must not provide clinical advice or imply messages were sent.
+- Lift routing into a **LangGraph** agent so it generalizes to unseen item types without code changes — the deterministic-routing tradeoff above is the right call now, but the inbox will eventually grow shapes the switch statement does not cover.
+- Add **LangSmith** (or equivalent) tracing for per-item LLM observability — token usage, latency, prompt-cache hit rate — alongside the existing tool trace.
+- Replace the mock tools with **real integrations**: EHR patient lookup, payer eligibility API, calendar system. The current shape (one `withItemContext`-scoped trace per item, schema-validated outputs) is intentionally designed to swap these in without touching the routing.
+- Add a **classification confidence threshold**: items below threshold skip routing and go straight to human review with no tool calls fired.
+- **Spanish-language classification prompt variant.** When the language detector flags Spanish before the LLM call, swap to a system prompt written natively in Spanish rather than asking an English-trained prompt to extract Spanish-language fields. Catches the long tail of edge cases that bilingual prompting handles imperfectly.

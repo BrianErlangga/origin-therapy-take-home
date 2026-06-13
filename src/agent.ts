@@ -148,6 +148,204 @@ function renderItemForClassification(item: InboxItem): string {
 }
 
 // ---------------------------------------------------------------------------
+// Stage 1.5 — Grounding gate (deterministic, no LLM)
+// ---------------------------------------------------------------------------
+// Stage 1 extracts identity fields from free text; Stage 2 then acts on them
+// with real tools: verify_insurance(member_id), hold_slot(patient_ref),
+// search_patient(name, dob), draft_message(contact). If the model fabricates or
+// corrupts one of these high-cost fields, nothing throws — the wrong value
+// silently lands in a clinic record.
+//
+// This gate verifies, deterministically (no second LLM call — re-asking the
+// model that just hallucinated rarely changes its answer), that each high-cost
+// field is traceable to the source text the model read. The guiding principle:
+// every meaningful component of an extracted value must appear in the source. A
+// null field is trivially grounded — the value simply wasn't present. See the
+// README "limitations" note for what grounding does NOT guarantee (correct
+// association, correct source).
+// ---------------------------------------------------------------------------
+
+export type HighCostField =
+  | "child_name"
+  | "dob_or_age"
+  | "member_id"
+  | "parent_contact";
+
+export interface GroundingVerdict {
+  field: HighCostField;
+  value: string;
+  grounded: boolean;
+}
+
+const GROUNDING_MISSING_LABELS: Record<HighCostField, string> = {
+  child_name: "patient name (could not be verified against the source message)",
+  dob_or_age: "date of birth / age (could not be verified against the source message)",
+  member_id: "insurance member ID (could not be verified against the source message)",
+  parent_contact: "parent/guardian contact (could not be verified against the source message)",
+};
+
+export function groundingMissingLabel(field: HighCostField): string {
+  return GROUNDING_MISSING_LABELS[field];
+}
+
+// Ground against exactly the text the model could have read the fields from:
+// sender, subject, and body. Names, emails, and member IDs frequently live in
+// the sender line ("Sofia Ramirez <sofia@...>") or subject, not just the body —
+// grounding against body alone would falsely flag them.
+export function groundingSource(item: InboxItem): string {
+  return [item.sender, item.subject, item.body].join("\n");
+}
+
+function stripDiacritics(s: string): string {
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+
+function normForName(s: string): string {
+  return stripDiacritics(s.toLowerCase());
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Whole-word match (ascii word boundary) after normalization.
+function containsWord(source: string, word: string): boolean {
+  return new RegExp(`(^|[^a-z0-9])${escapeRegExp(word)}([^a-z0-9]|$)`).test(source);
+}
+
+// member_id: structured alphanumeric. Strip dashes/spaces from both sides and
+// require the normalized run to appear in the normalized source. A fabricated
+// or single-character-off ID will not be present.
+export function groundMemberId(value: string, source: string): boolean {
+  const v = value.replace(/[\s-]/g, "").toLowerCase();
+  const src = source.replace(/[\s-]/g, "").toLowerCase();
+  return v.length > 0 && src.includes(v);
+}
+
+// parent_contact: email → case-insensitive substring. Phone → reduce both sides
+// to digits and require the digit sequence to appear (handles formatting
+// differences like "(555) 123-4567" vs "555-123-4567").
+export function groundParentContact(value: string, source: string): boolean {
+  if (value.includes("@")) {
+    return source.toLowerCase().includes(value.toLowerCase());
+  }
+  const digits = value.replace(/\D/g, "");
+  return digits.length >= 7 && source.replace(/\D/g, "").includes(digits);
+}
+
+// child_name: every token the model extracted (middle names included if present)
+// must appear as a whole word in the source. We don't mandate a fixed name shape
+// — we verify nothing was fabricated or normalized (e.g. "Bob" → "Robert", or a
+// fabricated surname). Bare initials are dropped, since a single letter matches
+// almost anything and carries little identifying weight.
+export function groundChildName(value: string, source: string): boolean {
+  const src = normForName(source);
+  const tokens = normForName(value)
+    .split(/[\s-]+/)
+    .map((t) => t.replace(/[.,]/g, ""))
+    .filter((t) => t.length > 1);
+  if (tokens.length === 0) return false;
+  return tokens.every((t) => containsWord(src, t));
+}
+
+// dob_or_age — a date or an age phrase. Three complementary paths:
+//
+// 1. Date (2+ numeric components, or a 4-digit year): compare by NUMERIC
+//    COMPONENT — split into numbers, normalize each (drop leading zeros), and
+//    require every component to appear as a standalone number in the source.
+//    Splitting on whole-digit runs gives the "standalone" property: a stray "7"
+//    inside a phone number ("555-7123") is part of the run "7123", so it never
+//    matches. Robust to separator/order/leading-zero differences ("2019-03-15"
+//    vs "03/15/2019"); a fabricated year (2003 vs 2002) is flagged. The 4-digit
+//    year is a strong anchor that makes coincidental matches unlikely.
+//
+// 2. Single-number age: requiring only that the number appear somewhere is too
+//    weak — a hallucinated "8 años" could coincidentally match a "8 sessions"
+//    in the text. So we require the number to appear in an AGE CONTEXT: next to
+//    a unit word (years/yrs/yo/months/mos/años/anos/meses/ans) or after a cue
+//    (age/aged/edad/is/tiene/turned/cumple). Cues cover the project's two
+//    languages (English + Spanish); an unrecognized phrasing falls through to
+//    fail-closed rather than grounding on a coincidence.
+//
+// 3. Word-form date written out ("the third of March, two thousand twenty"):
+//    no usable digits, but the classifier passes such phrases through verbatim,
+//    so we accept a verbatim-text match — the strongest grounding there is.
+//
+// Limitation: grounding deliberately does NOT resolve day/month ambiguity
+// (09/03 vs 03/09 share the same component set) — both readings are equally
+// supported by the source, so that is a downstream interpretation problem, not
+// a provenance one.
+export function groundDobOrAge(value: string, source: string): boolean {
+  const valueNums = value.match(/\d+/g) ?? [];
+  const isDate = valueNums.length >= 2 || valueNums.some((n) => n.length === 4);
+
+  // Path 1 — date by numeric component.
+  if (isDate) {
+    const sourceNums = new Set(
+      (source.match(/\d+/g) ?? []).map((n) => String(parseInt(n, 10))),
+    );
+    if (valueNums.every((n) => sourceNums.has(String(parseInt(n, 10))))) {
+      return true;
+    }
+  }
+
+  // Path 2 — single-number age, anchored to an age context in the source.
+  if (!isDate && valueNums.length === 1) {
+    const n = parseInt(valueNums[0]!, 10);
+    const unit = "years?|yrs?|yo|months?|mos?|a[nñ]os?|meses?|ans?";
+    const cue = "age|aged|edad|is|tiene|turned|cumpl\\w*|now";
+    const afterUnit = new RegExp(`\\b${n}\\s*-?\\s*(?:${unit})\\b`, "i");
+    const afterCue = new RegExp(`\\b(?:${cue})\\s+${n}\\b`, "i");
+    if (afterUnit.test(source) || afterCue.test(source)) {
+      return true;
+    }
+  }
+
+  // Path 3 — word-form date, grounded verbatim.
+  if (/[a-z]/i.test(value)) {
+    const v = value.toLowerCase().replace(/\s+/g, " ").trim();
+    return v.length > 0 && source.toLowerCase().replace(/\s+/g, " ").includes(v);
+  }
+  return false;
+}
+
+const GROUNDING_CHECKS: Record<
+  HighCostField,
+  (value: string, source: string) => boolean
+> = {
+  child_name: groundChildName,
+  dob_or_age: groundDobOrAge,
+  member_id: groundMemberId,
+  parent_contact: groundParentContact,
+};
+
+// Verify all non-null high-cost fields. Null fields are skipped (trivially
+// grounded — the value was not present in the source).
+export function verifyGrounding(
+  intake: ExtractedIntake,
+  source: string,
+): GroundingVerdict[] {
+  const values: Record<HighCostField, string | null> = {
+    child_name: intake.child_name,
+    dob_or_age: intake.dob_or_age,
+    member_id: intake.member_id,
+    parent_contact: intake.parent_contact,
+  };
+
+  const verdicts: GroundingVerdict[] = [];
+  for (const field of Object.keys(GROUNDING_CHECKS) as HighCostField[]) {
+    const value = values[field];
+    if (value == null) continue;
+    verdicts.push({ field, value, grounded: GROUNDING_CHECKS[field](value, source) });
+  }
+  return verdicts;
+}
+
+export function ungroundedFields(verdicts: GroundingVerdict[]): HighCostField[] {
+  return verdicts.filter((v) => !v.grounded).map((v) => v.field);
+}
+
+// ---------------------------------------------------------------------------
 // Stage 2 — Route (deterministic, no LLM)
 // ---------------------------------------------------------------------------
 
@@ -721,7 +919,23 @@ const DEFAULT_MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 
 export interface LLMClient {
   classifyAndExtract(item: InboxItem): Promise<ClassificationResult>;
+  // Re-extraction after a grounding failure. Names the specific fields that
+  // could not be traced to the source and instructs the model to copy them
+  // verbatim or null them — new information, unlike a blind re-ask.
+  classifyAndExtractWithGroundingHint(
+    item: InboxItem,
+    failedFields: HighCostField[],
+  ): Promise<ClassificationResult>;
   draftReply(input: DraftInput): Promise<string>;
+}
+
+function groundingHintSystemPrompt(failedFields: HighCostField[]): string {
+  return `${CLASSIFY_SYSTEM_PROMPT}
+
+# Grounding correction (retry)
+
+A verification step could not trace these fields to the source message: ${failedFields.join(", ")}.
+For each of those fields, re-read the message and either copy the value character-for-character exactly as it appears in the source (including the sender and subject lines), or set it to null if it is genuinely not present. Do not paraphrase, normalize, expand, or infer these values — copy verbatim or use null.`;
 }
 
 export async function classifyAndExtract(
@@ -734,37 +948,51 @@ export async function classifyAndExtract(
 function createLLMClient(): LLMClient {
   const anthropic = new Anthropic();
 
+  async function runClassification(
+    item: InboxItem,
+    systemPrompt: string,
+  ): Promise<ClassificationResult> {
+    const response = await anthropic.messages.parse({
+      model: DEFAULT_MODEL,
+      max_tokens: 16000,
+      thinking: { type: "adaptive" },
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      output_config: {
+        effort: "high",
+        format: zodOutputFormat(ClassificationResultSchema),
+      },
+      messages: [
+        {
+          role: "user",
+          content: renderItemForClassification(item),
+        },
+      ],
+    });
+
+    if (!response.parsed_output) {
+      throw new Error(
+        `classifyAndExtract(${item.id}): model did not return parseable structured output (stop_reason=${response.stop_reason})`,
+      );
+    }
+    return response.parsed_output;
+  }
+
   return {
     async classifyAndExtract(item: InboxItem): Promise<ClassificationResult> {
-      const response = await anthropic.messages.parse({
-        model: DEFAULT_MODEL,
-        max_tokens: 16000,
-        thinking: { type: "adaptive" },
-        system: [
-          {
-            type: "text",
-            text: CLASSIFY_SYSTEM_PROMPT,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
-        output_config: {
-          effort: "high",
-          format: zodOutputFormat(ClassificationResultSchema),
-        },
-        messages: [
-          {
-            role: "user",
-            content: renderItemForClassification(item),
-          },
-        ],
-      });
+      return runClassification(item, CLASSIFY_SYSTEM_PROMPT);
+    },
 
-      if (!response.parsed_output) {
-        throw new Error(
-          `classifyAndExtract(${item.id}): model did not return parseable structured output (stop_reason=${response.stop_reason})`,
-        );
-      }
-      return response.parsed_output;
+    async classifyAndExtractWithGroundingHint(
+      item: InboxItem,
+      failedFields: HighCostField[],
+    ): Promise<ClassificationResult> {
+      return runClassification(item, groundingHintSystemPrompt(failedFields));
     },
 
     async draftReply(input: DraftInput): Promise<string> {
@@ -804,12 +1032,86 @@ export async function runAgent(inbox: InboxItem[]): Promise<ItemOutput[]> {
   return Promise.all(
     inbox.map((item) =>
       withItemContext(item.id, async () => {
-        const classification = await llm.classifyAndExtract(item);
+        let classification = await llm.classifyAndExtract(item);
+
+        // ── Grounding verification (Stage 1 → Stage 2) ───────────────────
+        // Verify high-cost identity fields trace to the source before any
+        // tool acts on them. On failure: retry once with a verbatim hint,
+        // then fail closed to human review rather than act on bad data.
+        const source = groundingSource(item);
+        let verdicts = verifyGrounding(classification.extracted_intake, source);
+        let failed = ungroundedFields(verdicts);
+
+        if (failed.length > 0) {
+          classification = await llm.classifyAndExtractWithGroundingHint(
+            item,
+            failed,
+          );
+          verdicts = verifyGrounding(classification.extracted_intake, source);
+          failed = ungroundedFields(verdicts);
+        }
+
+        // Fail closed on ungrounded identity fields — EXCEPT safeguarding,
+        // which must always escalate. routeItem's safeguarding branch acts on
+        // item.id (not the identity fields), so it is safe to run even when a
+        // field is ungrounded; suppressing a P0 disclosure over a name-
+        // extraction problem would be the worse error.
+        if (failed.length > 0 && !classification.safeguarding) {
+          return assembleItemOutput(
+            item,
+            {
+              ...classification,
+              missing_info: [
+                ...classification.missing_info,
+                ...failed.map(groundingMissingLabel),
+              ],
+            },
+            groundingFailureRouting(failed),
+            null,
+          );
+        }
+
         const routing = await routeItem(item, classification);
+        if (failed.length > 0) {
+          // Safeguarding + ungrounded: the escalation already fired inside
+          // routeItem; surface the grounding gap loudly for the reviewer.
+          routing.requires_human_review = true;
+          routing.decision_rationale =
+            `[Grounding: could not verify ${failed.join(", ")} against source after one retry; ` +
+            `escalation proceeded because safeguarding overrides routing — verify these fields manually.] ` +
+            routing.decision_rationale;
+          classification = {
+            ...classification,
+            missing_info: [
+              ...classification.missing_info,
+              ...failed.map(groundingMissingLabel),
+            ],
+          };
+        } else if (verdicts.length > 0) {
+          routing.decision_rationale = `[Grounding: ${verdicts.length} high-cost field(s) verified against source.] ${routing.decision_rationale}`;
+        }
         const draft_reply = await draftReply(item, classification, routing, llm);
         return assembleItemOutput(item, classification, routing, draft_reply);
       }),
     ),
   );
+}
+
+// Fail-closed routing for an item whose identity fields could not be grounded
+// even after one retry. No tools fire on unverified data; the item goes
+// straight to human review with the failure recorded in the rationale.
+function groundingFailureRouting(failed: HighCostField[]): RoutingResult {
+  return {
+    task_ids: [],
+    escalation: null,
+    recommended_next_action:
+      "Staff must manually verify the flagged identity field(s) against the source message before any action is taken.",
+    requires_human_review: true,
+    decision_rationale:
+      `Grounding check failed after one retry for: ${failed.join(", ")}. ` +
+      `These values could not be traced to the source text, so no routing tools were called (fail-closed). ` +
+      `Routed to human review; the flagged fields are listed in missing_info.`,
+    needs_reply: false,
+  };
 }
 

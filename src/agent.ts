@@ -169,7 +169,8 @@ export type HighCostField =
   | "child_name"
   | "dob_or_age"
   | "member_id"
-  | "parent_contact";
+  | "parent_contact"
+  | "payer";
 
 export interface GroundingVerdict {
   field: HighCostField;
@@ -182,6 +183,7 @@ const GROUNDING_MISSING_LABELS: Record<HighCostField, string> = {
   dob_or_age: "date of birth / age (could not be verified against the source message)",
   member_id: "insurance member ID (could not be verified against the source message)",
   parent_contact: "parent/guardian contact (could not be verified against the source message)",
+  payer: "insurance payer (could not be verified against the source message)",
 };
 
 export function groundingMissingLabel(field: HighCostField): string {
@@ -309,6 +311,33 @@ export function groundDobOrAge(value: string, source: string): boolean {
   return false;
 }
 
+// payer: the insurance plan name. A hallucinated payer is one of the costliest
+// silent failures — claims go to the wrong carrier and deny months later — so
+// it is grounded like the identity fields. Plan names carry generic suffixes
+// ("PPO", "HMO") and filler ("health", "plan"); we drop those and require the
+// remaining significant tokens to appear in the source, mirroring the name
+// check. A value of only generic words falls back to a whole-string match. The
+// one bridge this does not cross is acronym↔expansion ("BCBS" vs "Blue Cross
+// Blue Shield"); the classifier is told to extract verbatim, and the retry
+// covers the occasional reformat.
+const PAYER_GENERIC_TOKENS = new Set([
+  "ppo", "hmo", "epo", "pos", "plan", "insurance", "health", "healthcare",
+  "the", "of", "and", "care", "medical", "group", "inc",
+]);
+
+export function groundPayer(value: string, source: string): boolean {
+  const src = normForName(source);
+  const tokens = normForName(value)
+    .split(/[\s-]+/)
+    .map((t) => t.replace(/[.,]/g, ""))
+    .filter((t) => t.length > 1 && !PAYER_GENERIC_TOKENS.has(t));
+  if (tokens.length === 0) {
+    const v = normForName(value).trim();
+    return v.length > 0 && src.includes(v);
+  }
+  return tokens.every((t) => containsWord(src, t));
+}
+
 const GROUNDING_CHECKS: Record<
   HighCostField,
   (value: string, source: string) => boolean
@@ -317,6 +346,7 @@ const GROUNDING_CHECKS: Record<
   dob_or_age: groundDobOrAge,
   member_id: groundMemberId,
   parent_contact: groundParentContact,
+  payer: groundPayer,
 };
 
 // Verify all non-null high-cost fields. Null fields are skipped (trivially
@@ -330,6 +360,7 @@ export function verifyGrounding(
     dob_or_age: intake.dob_or_age,
     member_id: intake.member_id,
     parent_contact: intake.parent_contact,
+    payer: intake.payer,
   };
 
   const verdicts: GroundingVerdict[] = [];
@@ -1026,9 +1057,10 @@ function createLLMClient(): LLMClient {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-export async function runAgent(inbox: InboxItem[]): Promise<ItemOutput[]> {
-  const llm = createLLMClient();
-
+export async function runAgent(
+  inbox: InboxItem[],
+  llm: LLMClient = createLLMClient(),
+): Promise<ItemOutput[]> {
   return Promise.all(
     inbox.map((item) =>
       withItemContext(item.id, async () => {

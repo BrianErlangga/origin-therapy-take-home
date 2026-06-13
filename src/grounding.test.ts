@@ -5,6 +5,7 @@ import {
   groundDobOrAge,
   groundMemberId,
   groundParentContact,
+  groundPayer,
   ungroundedFields,
   verifyGrounding,
 } from "./agent.js";
@@ -149,6 +150,28 @@ test("dob_or_age: day/month transposition is intentionally NOT flagged", () => {
   // Grounding verifies provenance, not date interpretation — resolving
   // 09/03 vs 03/09 is a downstream job. Documented limitation.
   assert.equal(groundDobOrAge("09/03/2002", "DOB 03/09/2002"), true);
+});
+
+// ---------------------------------------------------------------------------
+// payer
+// ---------------------------------------------------------------------------
+test("payer: grounds when significant tokens appear (generic suffix ignored)", () => {
+  assert.equal(groundPayer("Aetna PPO", "Insurance is Aetna PPO"), true);
+  assert.equal(
+    groundPayer("Blue Cross Blue Shield PPO", "Insurance: Blue Cross Blue Shield PPO"),
+    true,
+  );
+  assert.equal(groundPayer("Medicaid", "Tenemos Medicaid"), true);
+});
+
+test("payer: a hallucinated carrier (A -> B) is flagged", () => {
+  // The costly silent case: source says Aetna, model outputs Kaiser.
+  assert.equal(groundPayer("Kaiser Permanente", "Insurance is Aetna PPO"), false);
+});
+
+test("payer: matching only the generic suffix does not ground", () => {
+  // "PPO" alone must not ground a fabricated carrier.
+  assert.equal(groundPayer("Cigna PPO", "we have an Aetna PPO plan"), false);
 });
 
 // ---------------------------------------------------------------------------
